@@ -30,12 +30,11 @@ public class Account {
     @Column(nullable = false, updatable = false)
     private LocalDateTime createdAt;
 
-    public Account(String ownerName, String iban, String currency, AccountType type, BigDecimal balance) {
+    public Account(String ownerName, String iban, String currency, AccountType type) {
         this.ownerName = ownerName;
         this.iban = iban;
         this.currency = currency;
         this.type = type;
-        this.balance = balance;
     }
 
     public Account() {
