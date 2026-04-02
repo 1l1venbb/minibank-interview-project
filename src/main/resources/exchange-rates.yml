@@ -1,0 +1,9 @@
+# Pinned exchange rates for MiniBank - base currency is RON
+# Cross-currency conversions go through RON: source -> RON -> target
+# Do not modify: the automated test suite uses these exact values
+exchange:
+  rates:
+    EUR: 4.97
+    USD: 4.56
+    GBP: 5.73
+    RON: 1.00
