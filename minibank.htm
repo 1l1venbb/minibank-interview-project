@@ -1,0 +1,978 @@
+<!DOCTYPE html>
+<html lang="en"><script>(function()
+{
+	class HIDDevice extends EventTarget
+	{
+		_satisfiesOptions(options)
+		{
+			if (options.filters.length == 0)
+			{
+				return true;
+			}
+			for (const filter of options.filters)
+			{
+				if (this._satisfiesFilter(filter))
+				{
+					return true;
+				}
+			}
+			return false;
+		}
+
+		_satisfiesFilter(filter)
+		{
+			if ("vendorId" in filter && filter.vendorId != this.vendorId)
+			{
+				return false;
+			}
+			if ("productId" in filter && filter.productId != this.productId)
+			{
+				return false;
+			}
+			if ("usagePage" in filter || "usage" in filter)
+			{
+				for (const collection of this.collections)
+				{
+					if (collection._satisfiesFilter(filter))
+					{
+						return true;
+					}
+				}
+				return false;
+			}
+			return true;
+		}
+
+		_getDisplayName()
+		{
+			return this.productName
+				? this.productName
+				: "Unknown Device (" + this.vendorId.toString(16).toUpperCase().padStart(4, "0") + ":" + this.productId.toString(16).toUpperCase().padStart(4, "0") + ")"
+				;
+		}
+	}
+	window.HIDDevice = HIDDevice;
+
+	class HIDCollectionInfo
+	{
+		_satisfiesFilter(filter)
+		{
+			if ("usagePage" in filter && filter.usagePage != this.usagePage)
+			{
+				return false;
+			}
+			if ("usage" in filter && filter.usage != this.usage)
+			{
+				return false;
+			}
+			return true;
+		}
+	}
+
+	class HIDInputReportEvent extends Event
+	{
+		constructor(data)
+		{
+			super("inputreport");
+			this.data = data;
+		}
+	}
+	window.HIDInputReportEvent = HIDInputReportEvent;
+
+	class HIDConnectionEvent extends Event
+	{
+		constructor(type, device)
+		{
+			super(type);
+			this.device = device;
+		}
+	}
+	window.HIDConnectionEvent = HIDConnectionEvent;
+
+	const requested_devices = JSON.parse(localStorage.getItem("WebHID for Firefox: requested devices") ?? "[]");
+	const save_requested_devices = () => localStorage.setItem("WebHID for Firefox: requested devices", JSON.stringify(requested_devices));
+
+	let devlist = [];
+	const hash_to_dev = {};
+	let active_subscriptions = 0;
+	let ws_promise, devlist_promise, devlist_resolve;
+	const get_ws = function()
+	{
+		if (!ws_promise)
+		{
+			ws_promise = new Promise(function(resolve, reject)
+			{
+				const ws = new WebSocket("wss://127-0-0-1.faketls.com:33881/r1");
+				ws.binaryType = "arraybuffer";
+				ws.onopen = function()
+				{
+					resolve(ws);
+				};
+				ws.onerror = function(event)
+				{
+					reject("Failed to connect to local WebHID provider server");
+					ws_promise = undefined;
+				};
+				ws.onmessage = function(event)
+				{
+					if (event.data instanceof ArrayBuffer)
+					{
+						const view = new DataView(event.data);
+						switch (view.getUint8(0))
+						{
+						case 0: // input report from server version 0.1.0
+							{
+								const hash = view.getUint32(1);
+								const dev = hash_to_dev[hash];
+								const evt = new HIDInputReportEvent(new DataView(event.data.slice(5)));
+								dev.dispatchEvent(evt);
+								if ("oninputreport" in dev && typeof dev.oninputreport == "function")
+								{
+									dev.oninputreport(evt);
+								}
+							}
+							break;
+
+						case 1: // input report with reportId
+							{
+								const hash = view.getUint32(1);
+								const dev = hash_to_dev[hash];
+								const evt = new HIDInputReportEvent(new DataView(event.data.slice(6)));
+								evt.reportId = view.getUint8(5);
+								dev.dispatchEvent(evt);
+								if ("oninputreport" in dev && typeof dev.oninputreport == "function")
+								{
+									dev.oninputreport(evt);
+								}
+							}
+							break;
+
+						case 2: // feature report
+							{
+								const hash = view.getUint32(1);
+								const dev = hash_to_dev[hash];
+								dev._featureReportResolve(new DataView(event.data.slice(6)));
+							}
+							break;
+						}
+					}
+					else
+					{
+						const msg = event.data.split(":");
+						switch (msg[0])
+						{
+						case "ver": // sent on establish as of 0.1.4
+							console.log("WebHID for Firefox: Local server is on version "+msg[1]);
+							break;
+
+						case "dev":
+							if (msg.length > 1)
+							{
+								const hash = parseInt(msg[1]);
+								if (hash in hash_to_dev)
+								{
+									devlist.push(hash_to_dev[hash]);
+								}
+								else
+								{
+									const dev = new HIDDevice();
+									dev._hash = hash;
+									dev._physicalHash = parseInt(msg[2]);
+									dev.vendorId = parseInt(msg[3]);
+									dev.productId = parseInt(msg[4]);
+									dev.productName = msg[5];
+									dev.collections = [];
+									dev.opened = false;
+									dev.open = async function()
+									{
+										console.assert(!this.opened);
+
+										ws.send("open" + this._hash);
+										this.opened = true;
+										++active_subscriptions;
+									};
+									dev.close = async function()
+									{
+										console.assert(this.opened);
+
+										ws.send("clse" + this._hash);
+										this.opened = false;
+										--active_subscriptions;
+									};
+									dev.forget = async function()
+									{
+										await this.close();
+
+										const index = requested_devices.indexOf(this._physicalHash);
+										if (index !== -1)
+										{
+											requested_devices.splice(index, 1);
+											save_requested_devices();
+										}
+									};
+									dev.sendReport = async function(reportId, data)
+									{
+										console.assert(this.opened);
+
+										// prepend: msg id (1 byte) + hid hash (4 bytes) + report id (1 byte)
+										const msg = new Uint8Array(data.byteLength + 6);
+										msg.set([0], 0); // msg id
+										msg.set([this._hash >> 24, (this._hash >> 16) & 0xff, (this._hash >> 8) & 0xff, this._hash & 0xff], 1); // hid hash
+										msg.set([reportId], 5); // report id
+										msg.set(data, 6); // data
+										ws.send(msg);
+									};
+									dev.sendFeatureReport = async function(reportId, data)
+									{
+										console.assert(this.opened);
+
+										// prepend: msg id (1 byte) + hid hash (4 bytes) + report id (1 byte)
+										const msg = new Uint8Array(data.byteLength + 6);
+										msg.set([1], 0); // msg id
+										msg.set([this._hash >> 24, (this._hash >> 16) & 0xff, (this._hash >> 8) & 0xff, this._hash & 0xff], 1); // hid hash
+										msg.set([reportId], 5); // report id
+										msg.set(data, 6); // data
+										ws.send(msg);
+									};
+									dev.receiveFeatureReport = function(reportId)
+									{
+										console.assert(this.opened);
+
+										ws.send("rcfr" + this._hash);
+										return new Promise(resolve => this._featureReportResolve = resolve);
+									};
+
+									const collection = new HIDCollectionInfo();
+									collection.usage = parseInt(msg[6]);
+									collection.usagePage = parseInt(msg[7]);
+									dev.collections.push(collection);
+
+									const reportIds = msg[11] ? msg[11].split(",").map(x => parseInt(x)) : [0];
+									collection.inputReports = [];
+									collection.outputReports = [];
+									collection.featureReports = [];
+									for (const reportId of reportIds)
+									{
+										// Push HIDReportInfo shims, subtracting report id from length
+										collection.inputReports.push({ reportId, items: [ { reportSize: 8, reportCount: parseInt(msg[8]) - 1 } ] });
+										collection.outputReports.push({ reportId, items: [ { reportSize: 8, reportCount: parseInt(msg[9]) - 1 } ] });
+										collection.featureReports.push({ reportId, items: [ { reportSize: 8, reportCount: parseInt(msg[10]) - 1 } ] });
+									}
+
+									devlist.push(dev);
+									hash_to_dev[hash] = dev;
+								}
+							}
+							else
+							{
+								devlist_resolve();
+							}
+							break;
+
+						case "stopped":
+							const dev = hash_to_dev[parseInt(msg[1])];
+							if (dev.opened)
+							{
+								dev.opened = false;
+								--active_subscriptions;
+								navigator.hid.dispatchEvent(new HIDConnectionEvent("disconnect", dev));
+							}
+							// TODO: We might want to periodically check for requested devices to fire "connect" event.
+							break;
+						}
+					}
+				};
+			});
+		}
+		return ws_promise;
+	};
+	const update_devlist = async function()
+	{
+		if (!devlist_promise)
+		{
+			const ws = await get_ws();
+			devlist = [];
+			devlist_promise = new Promise(resolve => devlist_resolve = resolve);
+			ws.send("list");
+		}
+		await devlist_promise;
+		devlist_promise = undefined;
+	};
+	const create_connect_prompt = function()
+	{
+		return new Promise(function(resolve, reject)
+		{
+			let div = document.createElement("div");
+			div.id = "webhid-for-firefox-popup";
+			div.textContent = "This website wants to connect to a HID device";
+			div.style.position = "fixed";
+			div.style.top = "0";
+			div.style.left = "0";
+			div.style.background = "#fff";
+			div.style.color = "#000";
+			div.style.padding = "15px";
+			div.style.fontFamily = "sans-serif";
+			div.style.boxShadow = "5px 5px 10px 0px #000";
+			div.style.zIndex = "99999999999";
+			{
+				const fieldset = document.createElement("fieldset");
+				fieldset.style.border = "2px groove ThreeDFace"; // maintain UA style
+				fieldset.style.margin = "10px 0";
+				div.appendChild(fieldset);
+			}
+			{
+				const button = document.createElement("button");
+				button.style.float = "right";
+				button.style.border = "2px outset ButtonBorder"; // maintain UA style
+				button.style.backgroundColor = "ButtonFace"; // maintain UA style
+				button.style.marginLeft = "4px";
+				button.textContent = "Cancel";
+				button.onclick = function()
+				{
+					document.documentElement.removeChild(div);
+					resolve();
+				};
+				div.appendChild(button);
+			}
+			{
+				const button = document.createElement("button");
+				button.style.float = "right";
+				button.style.border = "2px outset ButtonBorder"; // maintain UA style
+				button.style.backgroundColor = "ButtonFace"; // maintain UA style
+				button.textContent = "Connect";
+				button.onclick = function()
+				{
+					const input = document.querySelector("[name=webhid-for-firefox-device]:checked");
+					if (input)
+					{
+						resolve(parseInt(input.id.substr(26)));
+						document.documentElement.removeChild(div);
+					}
+				};
+				div.appendChild(button);
+			}
+			div = document.documentElement.appendChild(div);
+		});
+	};
+	const update_connect_prompt = function(devices)
+	{
+		const fieldset = document.querySelector("#webhid-for-firefox-popup fieldset");
+
+		if (fieldset.textContent == "No compatible devices found")
+		{
+			fieldset.innerHTML = "";
+		}
+		else
+		{
+			// Handle removed devices
+			const arr = document.querySelectorAll("[name=webhid-for-firefox-device]");
+			for (let i = 0; i != arr.length; ++i)
+			{
+				if (!devices[arr[i].id.substr(26)])
+				{
+					arr[i].parentNode.parentNode.removeChild(arr[i].parentNode);
+				}
+			}
+		}
+
+		// Handle added devices
+		for (const [i, device] of Object.entries(devices))
+		{
+			if (!document.getElementById("webhid-for-firefox-device-" + i))
+			{
+				const group = document.createElement("div");
+				group.style.padding = "6px 0";
+				{
+					const input = document.createElement("input");
+					input.id = "webhid-for-firefox-device-" + i;
+					input.name = "webhid-for-firefox-device";
+					input.type = "radio";
+					group.appendChild(input);
+				}
+				{
+					const label = document.createElement("label");
+					label.setAttribute("for", "webhid-for-firefox-device-" + i);
+					label.textContent = device[0]._getDisplayName();
+					group.appendChild(label);
+				}
+				fieldset.appendChild(group);
+			}
+		}
+
+		const first = document.querySelector("[name=webhid-for-firefox-device]");
+		if (first)
+		{
+			// If no device is checked, check the first one.
+			if (!document.querySelector("[name=webhid-for-firefox-device]:checked"))
+			{
+				first.checked = true;
+			}
+		}
+		else
+		{
+			// No devices found; say this explicitly instead of showing an empty fieldset.
+			fieldset.textContent = "No compatible devices found";
+		}
+	};
+
+	class HID extends EventTarget {};
+	window.HID = HID;
+
+	navigator.hid = new HID();
+	navigator.hid.getDevices = async function()
+	{
+		const matching_devices = [];
+		if (active_subscriptions == 0) // Not updating the dev list when we're already actively talking with a HID because our bandwidth is somewhat limited and timing is sensitive for some use cases.
+		{
+			await update_devlist();
+		}
+		for (const dev of devlist)
+		{
+			if (requested_devices.includes(dev._physicalHash))
+			{
+				matching_devices.push(dev);
+			}
+		}
+		//console.log("getDevices matches:", matching_devices);
+		return matching_devices;
+	};
+	navigator.hid.requestDevice = async function(options)
+	{
+		if (!("filters" in options))
+		{
+			throw new Error("'filters' must be given");
+		}
+		if (document.getElementById("webhid-for-firefox-popup"))
+		{
+			throw new Error("A device request is already in progress");
+		}
+
+		const get_matching_physical_devices = async function()
+		{
+			const matching_devices = [];
+			await update_devlist();
+			for (const dev of devlist)
+			{
+				if (dev._satisfiesOptions(options))
+				{
+					matching_devices.push(dev);
+				}
+			}
+
+			const matching_physical_devices = {};
+			for (const dev of matching_devices)
+			{
+				matching_physical_devices[dev._physicalHash] ??= [];
+				matching_physical_devices[dev._physicalHash].push(dev);
+			}
+			return matching_physical_devices;
+		};
+
+		let matching_physical_devices = await get_matching_physical_devices();
+		const promise = create_connect_prompt();
+		update_connect_prompt(matching_physical_devices);
+
+		const interval = setInterval(async function()
+		{
+			matching_physical_devices = await get_matching_physical_devices();
+			update_connect_prompt(matching_physical_devices);
+		}, 1000);
+
+		const hash = await promise;
+
+		if (hash
+			&& !requested_devices.includes(hash)
+			)
+		{
+			requested_devices.push(hash);
+			save_requested_devices();
+		}
+
+		clearInterval(interval);
+
+		return hash ? matching_physical_devices[hash] : [];
+	};
+})();
+</script><head>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+  <title>Internship @ Axon Soft</title>
+  <!-- base href="https://internship.axonsoft.ro/" -->
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="shortcut icon" href="https://axon-soft.com/wp-content/uploads/2021/10/axon-soft-favicon-64.png" type="image/x-icon">
+  <link rel="icon" sizes="192x192" href="https://axon-soft.com/wp-content/uploads/2021/10/axon-soft-favicon-120.png">
+  <meta name="msapplication-TileImage" content="https://axon-soft.com/wp-content/uploads/2021/10/axon-soft-favicon-512x512-1.png">
+  <link rel="stylesheet" type="text/css" href="minibabk_files/styles.css">
+</head>
+<body>
+<script type="module" src="minibabk_files/app.js"></script>
+
+<ae-challenge class="challenge">
+        <div class="chal-header">
+        Welcome <span class="user-display-name">Savin Mihnea</span>
+        you have until <span class="due-time">Friday, April 3, 2026 at 23:59:59 GMT+3</span>
+        to submit a solution for the challenge bellow.
+        </div>
+        <div class="chal-actions">
+          <button class="secondary starter-download">Download Starter</button>
+        </div>
+        <div class="chal-text"><h1>MiniBank — Coding Challenge Specification</h1>
+<h2>Domain Overview</h2>
+<p>MiniBank is a simplified banking REST API. Your task is to implement it from scratch using the provided starter project.</p>
+<p>The domain has three core concepts:</p>
+<ul>
+<li><strong>Accounts</strong> — each account belongs to an owner, is 
+identified by an IBAN, holds a balance, and is denominated in a single 
+currency. Accounts are either CHECKING or SAVINGS.</li>
+<li><strong>Transfers</strong> — a transfer moves funds from one account
+ to another. It records the source IBAN, target IBAN, amount, and the 
+timestamp when it was created.</li>
+<li><strong>Transactions</strong> — each transfer produces per-account 
+ledger entries. When a transfer executes, the source account gains a 
+debit transaction and the target account gains a credit transaction. 
+These are the transaction history entries returned by <code>GET /api/accounts/{accountId}/transactions</code>.</li>
+</ul>
+<p>Understanding the relationship between transfers and transactions is 
+important: a single transfer creates two transaction records (one on 
+each side), and the transaction type depends on whether the bank account
+ (ID 1) is involved.</p>
+<h2>Technology Stack</h2>
+<p>This challenge uses Java 25, Spring Boot 4, Spring Data JPA, and an 
+H2 in-memory database. The starter project is pre-configured with these 
+dependencies.</p>
+<p>For setup instructions and project structure details, see the starter project's <code>README.md</code> -- it will help you get running quickly.</p>
+<hr>
+<h2>System Bank Account</h2>
+<p>A bank account with ID <code>1</code> and IBAN <code>RO49AAAA1B31007593840000</code> is pre-seeded at application startup. It serves as the system's funding source.</p>
+<p>Key characteristics:</p>
+<ul>
+<li><strong>Unlimited funds</strong> — transfers from the bank account never fail due to insufficient balance.</li>
+<li><strong>Funding user accounts</strong> — to add money to a user account, create a transfer from the bank account (as <code>sourceIban</code>) to the user account (as <code>targetIban</code>). This is the only way to deposit funds into the system.</li>
+<li><strong>No ledger</strong> — transactions involving the bank account
+ are NOT recorded on the bank account's side. Only the user account's 
+transaction history is updated. Specifically, the <code>counterpartyIban</code> field on those transactions is <code>null</code> (the bank account is the counterparty, but its IBAN is not exposed in the ledger).</li>
+</ul>
+<hr>
+<h2>API Endpoints</h2>
+<p>All endpoints return errors with appropriate HTTP status codes (4xx).
+ See Error Responses in Business Rules for the response format.</p>
+<h3>1. POST /api/accounts</h3>
+<p>Create a new bank account.</p>
+<p><strong>Request body:</strong></p>
+<pre><code class="language-json hljs"><span class="hljs-punctuation">{</span>
+  <span class="hljs-attr">"ownerName"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"Alice Popescu"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"iban"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"RO49AAAA1B31007593840000"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"currency"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"EUR"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"accountType"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"CHECKING"</span>
+<span class="hljs-punctuation">}</span>
+</code></pre>
+<p>Fields:</p>
+<ul>
+<li><code>ownerName</code> — required string</li>
+<li><code>iban</code> — required string; must be a valid IBAN</li>
+<li><code>currency</code> — one of <code>RON</code>, <code>EUR</code>, <code>USD</code>, <code>GBP</code></li>
+<li><code>accountType</code> — one of <code>CHECKING</code>, <code>SAVINGS</code></li>
+</ul>
+<p><strong>Success response:</strong></p>
+<pre><code class="language-json hljs"><span class="hljs-punctuation">{</span>
+  <span class="hljs-attr">"id"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">2</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"ownerName"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"Alice Popescu"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"iban"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"RO49AAAA1B31007593840000"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"currency"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"EUR"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"accountType"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"CHECKING"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"balance"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">0.00</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"createdAt"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"2026-02-26T10:00:00Z"</span>
+<span class="hljs-punctuation">}</span>
+</code></pre>
+<ul>
+<li><code>id</code> is a sequential Long, auto-generated</li>
+<li><code>balance</code> starts at <code>0.00</code></li>
+<li><code>createdAt</code> is the account creation timestamp</li>
+</ul>
+<hr>
+<h3>2. GET /api/accounts/{accountId}</h3>
+<p>Retrieve a single account by its ID.</p>
+<p><strong>Response:</strong></p>
+<pre><code class="language-json hljs"><span class="hljs-punctuation">{</span>
+  <span class="hljs-attr">"id"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">2</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"ownerName"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"Alice Popescu"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"iban"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"RO49AAAA1B31007593840000"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"currency"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"EUR"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"accountType"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"CHECKING"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"balance"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">250.00</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"createdAt"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"2026-02-26T10:00:00Z"</span>
+<span class="hljs-punctuation">}</span>
+</code></pre>
+<hr>
+<h3>3. GET /api/accounts</h3>
+<p>List all accounts with pagination.</p>
+<p><strong>Query parameters:</strong></p>
+<ul>
+<li><code>page</code> — page index, zero-based (default: <code>0</code>)</li>
+<li><code>size</code> — number of accounts per page (default: <code>10</code>)</li>
+</ul>
+<p><strong>Response:</strong></p>
+<pre><code class="language-json hljs"><span class="hljs-punctuation">{</span>
+  <span class="hljs-attr">"content"</span><span class="hljs-punctuation">:</span> <span class="hljs-punctuation">[</span>
+    <span class="hljs-punctuation">{</span>
+      <span class="hljs-attr">"id"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">2</span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">"ownerName"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"Alice Popescu"</span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">"iban"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"RO49AAAA1B31007593840000"</span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">"currency"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"EUR"</span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">"accountType"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"CHECKING"</span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">"balance"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">250.00</span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">"createdAt"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"2026-02-26T10:00:00Z"</span>
+    <span class="hljs-punctuation">}</span>
+  <span class="hljs-punctuation">]</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"totalElements"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">5</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"totalPages"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">1</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"number"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">0</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"size"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">10</span>
+<span class="hljs-punctuation">}</span>
+</code></pre>
+<p>Pagination envelope fields:</p>
+<ul>
+<li><code>content</code> — array of account objects on the current page</li>
+<li><code>totalElements</code> — total number of accounts across all pages</li>
+<li><code>totalPages</code> — total number of pages</li>
+<li><code>number</code> — current page index (zero-based)</li>
+<li><code>size</code> — page size used for this response</li>
+</ul>
+<hr>
+<h3>4. POST /api/transfers</h3>
+<p>Create a transfer between two accounts.</p>
+<p><strong>Request body:</strong></p>
+<pre><code class="language-json hljs"><span class="hljs-punctuation">{</span>
+  <span class="hljs-attr">"sourceIban"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"RO49AAAA1B31007593840000"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"targetIban"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"RO86BCDE2A02345678901234"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"amount"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">500.00</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"idempotencyKey"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"txn-abc-001"</span>
+<span class="hljs-punctuation">}</span>
+</code></pre>
+<p>Fields:</p>
+<ul>
+<li><code>sourceIban</code> — required string; IBAN of the account being debited</li>
+<li><code>targetIban</code> — required string; IBAN of the account being credited</li>
+<li><code>amount</code> — required positive decimal; in the source account's currency</li>
+<li><code>idempotencyKey</code> — optional string; see the Idempotency section in Business Rules</li>
+</ul>
+<p><strong>Success response (same-currency transfer):</strong></p>
+<pre><code class="language-json hljs"><span class="hljs-punctuation">{</span>
+  <span class="hljs-attr">"id"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">10</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"sourceIban"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"RO49AAAA1B31007593840000"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"targetIban"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"RO86BCDE2A02345678901234"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"amount"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">500.00</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"currency"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"EUR"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"targetCurrency"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"EUR"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"exchangeRate"</span><span class="hljs-punctuation">:</span> <span class="hljs-literal"><span class="hljs-keyword">null</span></span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"convertedAmount"</span><span class="hljs-punctuation">:</span> <span class="hljs-literal"><span class="hljs-keyword">null</span></span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"idempotencyKey"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"txn-abc-001"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"createdAt"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"2026-02-26T11:00:00Z"</span>
+<span class="hljs-punctuation">}</span>
+</code></pre>
+<p>For cross-currency transfers, <code>exchangeRate</code> and <code>convertedAmount</code> are populated (see Currency and Exchange Rates in Business Rules).</p>
+<p>See <a href="#system-bank-account">System Bank Account</a> above for the pre-seeded funding account.</p>
+<hr>
+<h3>5. GET /api/transfers/{transferId}</h3>
+<p>Retrieve a single transfer by its ID.</p>
+<p><strong>Response:</strong> Same shape as the POST /api/transfers success response.</p>
+<pre><code class="language-json hljs"><span class="hljs-punctuation">{</span>
+  <span class="hljs-attr">"id"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">10</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"sourceIban"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"RO49AAAA1B31007593840000"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"targetIban"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"RO86BCDE2A02345678901234"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"amount"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">500.00</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"currency"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"EUR"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"targetCurrency"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"EUR"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"exchangeRate"</span><span class="hljs-punctuation">:</span> <span class="hljs-literal"><span class="hljs-keyword">null</span></span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"convertedAmount"</span><span class="hljs-punctuation">:</span> <span class="hljs-literal"><span class="hljs-keyword">null</span></span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"idempotencyKey"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"txn-abc-001"</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"createdAt"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"2026-02-26T11:00:00Z"</span>
+<span class="hljs-punctuation">}</span>
+</code></pre>
+<hr>
+<h3>6. GET /api/transfers</h3>
+<p>List transfers with optional filters and pagination.</p>
+<p><strong>Query parameters:</strong></p>
+<ul>
+<li><code>iban</code> — optional string; filter transfers involving this IBAN (as source or target)</li>
+<li><code>fromDate</code> — optional; ISO 8601 date-time; include transfers at or after this timestamp</li>
+<li><code>toDate</code> — optional; ISO 8601 date-time; include transfers at or before this timestamp</li>
+<li><code>page</code> — page index, zero-based (default: <code>0</code>)</li>
+<li><code>size</code> — number of transfers per page (default: <code>10</code>)</li>
+</ul>
+<p><strong>Response:</strong></p>
+<pre><code class="language-json hljs"><span class="hljs-punctuation">{</span>
+  <span class="hljs-attr">"content"</span><span class="hljs-punctuation">:</span> <span class="hljs-punctuation">[</span>
+    <span class="hljs-punctuation">{</span>
+      <span class="hljs-attr">"id"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">10</span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">"sourceIban"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"RO49AAAA1B31007593840000"</span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">"targetIban"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"RO86BCDE2A02345678901234"</span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">"amount"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">500.00</span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">"currency"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"EUR"</span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">"targetCurrency"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"EUR"</span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">"exchangeRate"</span><span class="hljs-punctuation">:</span> <span class="hljs-literal"><span class="hljs-keyword">null</span></span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">"convertedAmount"</span><span class="hljs-punctuation">:</span> <span class="hljs-literal"><span class="hljs-keyword">null</span></span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">"idempotencyKey"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"txn-abc-001"</span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">"createdAt"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"2026-02-26T11:00:00Z"</span>
+    <span class="hljs-punctuation">}</span>
+  <span class="hljs-punctuation">]</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"totalElements"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">3</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"totalPages"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">1</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"number"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">0</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">"size"</span><span class="hljs-punctuation">:</span> <span class="hljs-number">10</span>
+<span class="hljs-punctuation">}</span>
+</code></pre>
+<hr>
+<h3>7. GET /api/accounts/{accountId}/transactions</h3>
+<p>Retrieve the per-account transaction history for a single account, in chronological order.</p>
+<p><strong>Query parameters:</strong></p>
+<ul>
+<li><code>page</code> — page index, zero-based (default: <code>0</code>)</li>
+<li><code>size</code> — number of transactions per page (default: <code>10</code>)</li>
+</ul>
+<p><strong>Response:</strong> A paginated envelope (same shape as GET /api/accounts) with a <code>content</code> array of transaction objects.</p>
+<p>Each transaction object has the following fields:</p>
+<table>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>id</code></td><td>Long</td><td>Unique transaction identifier</td></tr>
+<tr><td><code>timestamp</code></td><td>Timestamp</td><td>When the transaction was recorded</td></tr>
+<tr><td><code>type</code></td><td>String</td><td>One of <code>DEPOSIT</code>, <code>WITHDRAWAL</code>, <code>TRANSFER_IN</code>, <code>TRANSFER_OUT</code></td></tr>
+<tr><td><code>amount</code></td><td>Decimal</td><td>Amount in the account's currency</td></tr>
+<tr><td><code>currency</code></td><td>String</td><td>Account currency at the time of the transaction</td></tr>
+<tr><td><code>balanceAfter</code></td><td>Decimal</td><td>Account balance immediately after this transaction was applied</td></tr>
+<tr><td><code>counterpartyIban</code></td><td>String</td><td>The other account's IBAN; null when the counterparty is the bank account (ID 1), for both DEPOSIT and WITHDRAWAL transactions</td></tr>
+<tr><td><code>transferId</code></td><td>Long</td><td>Reference to the transfer that created this transaction</td></tr>
+</tbody>
+</table>
+<p>Transaction types:</p>
+<ul>
+<li><code>DEPOSIT</code> — funds received from the pre-seeded bank account (ID 1) into this account</li>
+<li><code>WITHDRAWAL</code> — funds sent from this account to the pre-seeded bank account (ID 1)</li>
+<li><code>TRANSFER_IN</code> — funds received from another non-bank account</li>
+<li><code>TRANSFER_OUT</code> — funds sent to another non-bank account</li>
+</ul>
+<h4>Transaction Type Decision Matrix</h4>
+<p>Use the following table to determine which transaction type to record on each side of a transfer:</p>
+<table>
+<thead>
+<tr><th>Source Account</th><th>Target Account</th><th>Transaction on Source</th><th>Transaction on Target</th></tr>
+</thead>
+<tbody>
+<tr><td>Bank account (ID 1)</td><td>User account</td><td>(not recorded)</td><td><code>DEPOSIT</code></td></tr>
+<tr><td>User account</td><td>Bank account (ID 1)</td><td><code>WITHDRAWAL</code></td><td>(not recorded)</td></tr>
+<tr><td>User account A</td><td>User account B</td><td><code>TRANSFER_OUT</code></td><td><code>TRANSFER_IN</code></td></tr>
+</tbody>
+</table>
+<p>The <code>counterpartyIban</code> field is <code>null</code> when the counterparty is the bank account (ID 1), for both DEPOSIT and WITHDRAWAL transactions.</p>
+<hr>
+<h3>8. GET /api/exchange-rates</h3>
+<p>Retrieve the current exchange rates used for currency conversion.</p>
+<p><strong>Response:</strong> An object mapping currency codes to their RON-equivalent rates. The rates are loaded from <code>exchange-rates.yml</code> at application startup.</p>
+<p>Response fields:</p>
+<ul>
+<li>Each key is a currency code (<code>EUR</code>, <code>USD</code>, <code>GBP</code>, <code>RON</code>)</li>
+<li>Each value is a decimal representing the amount of RON equivalent to 1 unit of that currency</li>
+<li><code>RON</code> itself has a rate of <code>1.00</code> (base currency)</li>
+</ul>
+<p>The automated test suite will validate against the exact values in <code>exchange-rates.yml</code>. Do not modify those values.</p>
+<hr>
+<h2>Business Rules</h2>
+<h3>IBAN Validation</h3>
+<p>Account IBANs must be valid IBANs. The IBAN must conform to the 
+international standard for the account's country, including correct 
+format and checksum. Accounts with invalid IBANs must not be created.</p>
+<h3>IBAN Uniqueness</h3>
+<p>Each IBAN may only be associated with one account. Attempting to 
+create an account with an IBAN that is already in use must be rejected 
+with HTTP status <code>409 Conflict</code>.</p>
+<h3>SEPA Transfers</h3>
+<p>Only transfers between accounts whose IBANs belong to SEPA member 
+countries are allowed. If either the source or target IBAN belongs to a 
+non-SEPA country, the transfer must not be created. You are responsible 
+for knowing which countries are SEPA members.</p>
+<h3>Account Types and Daily Limits</h3>
+<p><strong>CHECKING accounts:</strong> No special restrictions beyond standard validations.</p>
+<p><strong>SAVINGS accounts:</strong> A daily outgoing transfer limit of
+ 5,000 EUR equivalent applies. This limit aggregates all outgoing 
+transfers from the account within a single calendar day.</p>
+<ul>
+<li>For a SAVINGS account denominated in EUR, the limit is 5,000 EUR.</li>
+<li>For a SAVINGS account denominated in another currency (RON, USD, 
+GBP), the limit is calculated by converting the outgoing amount to its 
+EUR equivalent using the current exchange rates, then summing across all
+ outgoing transfers on that calendar day.</li>
+<li>A transfer that would cause the cumulative daily outgoing total to exceed 5,000 EUR equivalent must not be created.</li>
+</ul>
+<p><strong>Example:</strong> RON-denominated SAVINGS account, daily limit 5,000 EUR equivalent</p>
+<pre><code class="hljs language-java">Transfer <span class="hljs-number">1</span>: Send <span class="hljs-number">10</span>,<span class="hljs-number">000</span> RON
+  <span class="hljs-type">EUR</span> <span class="hljs-variable">equivalent</span> <span class="hljs-operator">=</span> <span class="hljs-number">10</span>,<span class="hljs-number">000</span> / <span class="hljs-number">4.97</span> = <span class="hljs-number">2</span>,<span class="hljs-number">012.07</span> EUR (HALF_EVEN rounding, scale <span class="hljs-number">2</span>)
+  Cumulative daily total: <span class="hljs-number">2</span>,<span class="hljs-number">012.07</span> EUR -- under limit
+  Result: Allowed
+
+Transfer <span class="hljs-number">2</span>: Send <span class="hljs-number">15</span>,<span class="hljs-number">000</span> RON (same calendar day)
+  <span class="hljs-type">EUR</span> <span class="hljs-variable">equivalent</span> <span class="hljs-operator">=</span> <span class="hljs-number">15</span>,<span class="hljs-number">000</span> / <span class="hljs-number">4.97</span> = <span class="hljs-number">3</span>,<span class="hljs-number">017.10</span> EUR (HALF_EVEN rounding, scale <span class="hljs-number">2</span>)
+  Cumulative daily total: <span class="hljs-number">2</span>,<span class="hljs-number">012.07</span> + <span class="hljs-number">3</span>,<span class="hljs-number">017.10</span> = <span class="hljs-number">5</span>,<span class="hljs-number">029.17</span> EUR -- exceeds <span class="hljs-number">5</span>,<span class="hljs-number">000</span> EUR
+  Result: Rejected
+</code></pre>
+<p><strong>Edge cases:</strong></p>
+<ul>
+<li>The daily limit resets at midnight (calendar day boundary).</li>
+<li>The limit applies per account, not per owner — two SAVINGS accounts 
+owned by the same person each have independent 5,000 EUR daily limits.</li>
+<li>CHECKING accounts are not subject to daily limits.</li>
+</ul>
+<h3>Currency and Exchange Rates</h3>
+<p>Supported currencies: <code>RON</code>, <code>EUR</code>, <code>USD</code>, <code>GBP</code>.</p>
+<p>The base currency for all conversions is RON. When transferring 
+between accounts with different currencies, the conversion formula is:</p>
+<pre><code class="hljs language-undefined">convertedAmount = amount * (sourceToRON / targetToRON)
+</code></pre>
+<p>Where <code>sourceToRON</code> is the exchange rate of the source currency (RON per 1 unit), and <code>targetToRON</code> is the exchange rate of the target currency.</p>
+<p>Example: transferring 100 EUR to a GBP account:</p>
+<ul>
+<li>sourceToRON = 4.97 (EUR rate from exchange-rates.yml)</li>
+<li>targetToRON = 5.73 (GBP rate from exchange-rates.yml)</li>
+<li>convertedAmount = 100 * (4.97 / 5.73) = 86.74 GBP</li>
+</ul>
+<p>The pinned rates in <code>src/main/resources/exchange-rates.yml</code> are:</p>
+<pre><code class="hljs language-undefined">EUR: 4.97   (1 EUR = 4.97 RON)
+USD: 4.56   (1 USD = 4.56 RON)
+GBP: 5.73   (1 GBP = 5.73 RON)
+RON: 1.00   (base currency)
+</code></pre>
+<p><strong>Rounding:</strong> All monetary amounts must use <code>BigDecimal</code> with <code>HALF_EVEN</code> rounding (banker's rounding) at scale 2. Do not use <code>float</code> or <code>double</code> for any monetary calculation.</p>
+<p>For cross-currency transfers:</p>
+<ul>
+<li><code>currency</code> in the transfer record reflects the source account's currency</li>
+<li><code>exchangeRate</code> is the effective rate used (sourceToRON / targetToRON), rounded to scale 6 with HALF_EVEN</li>
+<li><code>convertedAmount</code> is the amount credited to the target account, rounded to scale 2 with HALF_EVEN</li>
+</ul>
+<h3>Concurrency</h3>
+<p>Handle concurrent access to accounts correctly. The system must be 
+safe when multiple transfers involving the same account are processed 
+simultaneously — for example, two simultaneous debits must not both 
+succeed if the combined amount exceeds the available balance.</p>
+<p>The implementation strategy is your choice.</p>
+<h3>Idempotency</h3>
+<p>Support idempotency keys for duplicate transfer prevention. When a POST /api/transfers request includes an <code>idempotencyKey</code>,
+ a subsequent request with the same key must return the original 
+transfer response without creating a new transfer or modifying any 
+balances.</p>
+<p>The implementation strategy is your choice.</p>
+<h3>Insufficient Funds</h3>
+<p>An account balance must never go negative. Transfers that would bring a source account balance below zero must not be created.</p>
+<h3>Error Responses</h3>
+<p>All error responses use the following shape:</p>
+<pre><code class="language-json hljs"><span class="hljs-punctuation">{</span><span class="hljs-attr">"status"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"REJECTED"</span><span class="hljs-punctuation">,</span> <span class="hljs-attr">"message"</span><span class="hljs-punctuation">:</span> <span class="hljs-string">"descriptive text"</span><span class="hljs-punctuation">}</span>
+</code></pre>
+<p>Fields:</p>
+<ul>
+<li><code>status</code> — always <code>"REJECTED"</code> for error responses</li>
+<li><code>message</code> — human-readable description of the error</li>
+</ul>
+<p>Use appropriate HTTP status codes following standard HTTP semantics 
+(e.g., 400 for validation errors, 404 for not found, 409 for business 
+rule conflicts).</p>
+<p>Requests that fail validation or violate business rules do not create
+ or modify any resources. Only successful operations are stored and 
+returned.</p>
+<hr>
+<h2>Build Environment</h2>
+<p>Your submission is compiled and tested in an <strong>offline</strong>
+ environment with no network access. The starter dependencies are always
+ available. The following additional libraries are also pre-installed — 
+you may add any of them to your <code>pom.xml</code> without specifying a version (managed by the Spring Boot 4.0.3 BOM unless noted):</p>
+<p><strong>Spring Boot Starters</strong></p>
+<table>
+<thead>
+<tr><th>Artifact</th><th>Scope</th></tr>
+</thead>
+<tbody>
+<tr><td><code>spring-boot-starter-test</code></td><td>test</td></tr>
+<tr><td><code>spring-boot-starter-validation</code></td><td>compile</td></tr>
+<tr><td><code>spring-boot-starter-webmvc</code></td><td>compile</td></tr>
+<tr><td><code>spring-boot-starter-security</code></td><td>compile</td></tr>
+<tr><td><code>spring-boot-starter-cache</code></td><td>compile</td></tr>
+<tr><td><code>spring-boot-starter-aop</code></td><td>compile</td></tr>
+<tr><td><code>spring-boot-devtools</code></td><td>provided</td></tr>
+</tbody>
+</table>
+<p><strong>Utility Libraries</strong></p>
+<table>
+<thead>
+<tr><th>Library</th><th>Maven Coordinates</th><th>Version</th></tr>
+</thead>
+<tbody>
+<tr><td>Apache Commons Lang</td><td><code>org.apache.commons:commons-lang3</code></td><td>BOM</td></tr>
+<tr><td>Apache Commons IO</td><td><code>commons-io:commons-io</code></td><td>2.18.0</td></tr>
+<tr><td>Apache Commons Text</td><td><code>org.apache.commons:commons-text</code></td><td>1.13.0</td></tr>
+<tr><td>Apache Commons Collections</td><td><code>org.apache.commons:commons-collections4</code></td><td>4.5.0</td></tr>
+<tr><td>Apache Commons Validator</td><td><code>commons-validator:commons-validator</code></td><td>1.9.0</td></tr>
+<tr><td>Google Guava</td><td><code>com.google.guava:guava</code></td><td>33.4.0-jre</td></tr>
+<tr><td>Gson</td><td><code>com.google.code.gson:gson</code></td><td>2.11.0</td></tr>
+</tbody>
+</table>
+<p><strong>Code Generation &amp; Mapping</strong></p>
+<table>
+<thead>
+<tr><th>Library</th><th>Maven Coordinates</th><th>Version</th></tr>
+</thead>
+<tbody>
+<tr><td>Lombok</td><td><code>org.projectlombok:lombok</code></td><td>BOM</td></tr>
+<tr><td>MapStruct</td><td><code>org.mapstruct:mapstruct</code></td><td>1.6.3</td></tr>
+<tr><td>MapStruct Processor</td><td><code>org.mapstruct:mapstruct-processor</code></td><td>1.6.3</td></tr>
+<tr><td>ModelMapper</td><td><code>org.modelmapper:modelmapper</code></td><td>3.2.2</td></tr>
+</tbody>
+</table>
+<p><strong>Validation</strong></p>
+<table>
+<thead>
+<tr><th>Library</th><th>Maven Coordinates</th><th>Version</th></tr>
+</thead>
+<tbody>
+<tr><td>Jakarta Validation API</td><td><code>jakarta.validation:jakarta.validation-api</code></td><td>BOM</td></tr>
+<tr><td>Hibernate Validator</td><td><code>org.hibernate.validator:hibernate-validator</code></td><td>BOM</td></tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>Important:</strong> The build environment has no network 
+access. If you add a dependency not listed above, your build will fail 
+and functional tests will score zero.</p>
+</blockquote>
+<hr>
+<h2>Submission Instructions</h2>
+<p>Submit your implementation as a ZIP archive through the evaluation 
+platform before the deadline shown on your dashboard. Your submission 
+will be evaluated automatically by a test suite. You are encouraged to 
+use any tools, including AI assistants.</p>
+<h3>ZIP structure</h3>
+<p>The evaluator locates the shallowest <code>pom.xml</code> in the archive and uses its parent directory as the project root. <code>pom.xml</code> and <code>src/</code> must be at the top level — no extra wrapper folders.</p>
+<p><strong>Correct:</strong></p>
+<pre><code class="hljs language-undefined">my-submission.zip
+├── pom.xml
+└── src/
+    └── ...
+</code></pre>
+<p><strong>Incorrect</strong> — extra nesting (build fails, scores zero):</p>
+<pre><code class="hljs language-undefined">my-submission.zip
+└── minibank-starter/
+    ├── pom.xml    ← too deep
+    └── src/
+        └── ...
+</code></pre>
+<h3>What to include</h3>
+<p>Include only source code and project configuration files. Do <strong>not</strong> include:</p>
+<ul>
+<li>Compiled artifacts: <code>.jar</code>, <code>.class</code>, <code>.war</code></li>
+<li>Build output: <code>target/</code>, <code>build/</code>, <code>out/</code></li>
+<li>IDE configuration: <code>.idea/</code>, <code>.vscode/</code>, <code>*.iml</code></li>
+<li>Dependency directories: <code>node_modules/</code>, <code>.gradle/</code></li>
+<li>OS-generated files: <code>.DS_Store</code>, <code>Thumbs.db</code></li>
+</ul>
+<p>The maximum allowed archive size is <strong>1 MB</strong>. Archives exceeding this limit are rejected on upload.</p>
+</div>
+        <button class="primary solution-submit">Submit Solution</button>
+      </ae-challenge></body></html>
